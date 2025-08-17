@@ -22,6 +22,8 @@ def cute_reply(prompt: str) -> str:
         return f"{face} 에헤헷… 과분한 칭찬이에요! 더 열심히 할게요 💖"
     if "힘들" in prompt or "피곤" in prompt:
         return f"{face} 수고 많으셨어요… 따뜻한 물 한 잔과 가벼운 스트레칭 추천드려요 (ง •̀_•́)ง"
+    if "애미" in prompt:
+        return f"{face} 니애미~"
     # 기본
     return f"{face} 네! '{prompt}'(이)라고요. 메모해 뒀어요. 또 필요하신 건 없으신가요? ✨"
 

@@ -12,115 +12,174 @@ from discord.ext import commands
 from src.persona import PASTEL_PINK
 
 SAFEBOORU_API = "https://safebooru.org/index.php"
-UA = "AoiDiscordBot/1.3 (+https://discord.com)"
+UA = "AoiDiscordBot/1.4 (+https://discord.com)"
 
+# 표시용 타입 텍스트(없어도 동작에는 문제 없음)
 TAG_TYPE_MAP = {0: "일반", 1: "아티스트", 3: "저작권", 4: "캐릭터", 2: "메타"}
+
+# 허용 문자만: 영숫자/공백/_-()[].*~
 TAG_SAFE_RE = re.compile(r"[^0-9a-zA-Z _\-\(\)\[\]\.\*\~]+")
 
 # 자동완성 완전 실패 시 보여줄 로컬 기본 후보(일부 예시)
 POPULAR_TAGS = [
     "gawr_gura", "yoimiya_(genshin_impact)", "arona_(blue_archive)", "shiroko_(blue_archive)",
-    "nakiri_ayame", "inugami_korone", "amatsukaze_(kancolle)", "megumin", "asuka_langley",
-    "kirisame_marisa", "miku_hatsune", "yukinoshita_yukino", "kaguya_shinomiya"
+    "koharu_(blue_archive)", "nakiri_ayame", "inugami_korone", "amatsukaze_(kancolle)",
+    "megumin", "asuka_langley", "kirisame_marisa", "miku_hatsune", "kaguya_shinomiya"
 ]
 
 def _clean_for_query(s: str) -> str:
+    """입력 정리 + 공백→언더바 (Safebooru 태그 관습)"""
     s = TAG_SAFE_RE.sub("", s or "").strip()
-    s = re.sub(r"\s+", "_", s)  # 공백 → 언더바 (Safebooru 관습)
+    s = re.sub(r"\s+", "_", s)
     return s
 
 def _clean_for_display(s: str) -> str:
+    """표시용(그대로 보여주되 위험문자 제거)"""
     return TAG_SAFE_RE.sub("", s or "").strip()
 
 # ----------------- 태그 추천 -----------------
-async def _autocomplete2(query: str, limit: int) -> List[Dict]:
-    term = _clean_for_display(query)
-    params = {"page": "autocomplete2", "term": term.replace("_", " "), "type": "tag_query", "limit": str(limit)}
-    timeout = aiohttp.ClientTimeout(total=6)
+def _normalize_tag_label_to_name(raw: str) -> str:
+    """Autocomplete2가 주는 label/value를 보루 태그 표기로 정규화"""
+    s = (raw or "").strip().lower()
+    s = re.sub(r"\s+", "_", s)
+    return s
+
+def _score_tag(name: str, q: str, tag_type: int | None = None, count: int | None = None) -> int:
+    """
+    간단 점수: 접두어 매치>부분 매치, 캐릭터/저작권 가중, 카운트 약가중.
+    type 추정: 1 artist, 3 copyright, 4 character
+    """
+    name_l = name.lower()
+    q_l = q.lower()
+    sc = 0
+    if name_l.startswith(q_l):
+        sc += 120
+    if q_l in name_l:
+        sc += 60
+    if tag_type in (4, 3):
+        sc += 15
+    if count:
+        sc += min(count // 1000, 20)
+    if "(" in name or "_" in name:
+        sc += 5
+    return sc
+
+async def _autocomplete2(term: str, limit: int) -> List[Dict]:
+    """Safebooru의 실제 자동완성 API(page=autocomplete2)"""
+    params = {"page": "autocomplete2", "type": "tag_query", "term": term, "limit": str(limit)}
     headers = {"User-Agent": UA}
+    timeout = aiohttp.ClientTimeout(total=6)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
         async with s.get(SAFEBOORU_API, params=params) as r:
             if r.status != 200:
                 return []
             data = await r.json(content_type=None)
-    rows = []
+    rows: List[Dict] = []
     if isinstance(data, list):
-        for t in data:
-            name = (t.get("value") or "").strip()
-            if not name:
+        for it in data:
+            raw = (it.get("value") or it.get("label") or "").strip()
+            if not raw:
                 continue
-            rows.append({
-                "name": name,
-                "count": int(t.get("post_count", 0) or 0),
-                "type_text": (t.get("type") or "").lower(),
-            })
-    rows.sort(key=lambda x: (-x["count"], x["name"].lower()))
-    # 중복 제거
+            nm = _normalize_tag_label_to_name(raw)
+            cnt = int(it.get("post_count", 0) or 0)
+            typet = (it.get("type") or "").lower()
+            rows.append({"name": nm, "count": cnt, "type_text": typet})
+    # 중복 제거 + 정렬
     out, seen = [], set()
-    for r in rows:
+    for r in sorted(rows, key=lambda x: (-x["count"], x["name"])):
         k = r["name"].lower()
-        if k in seen: continue
+        if k in seen: 
+            continue
         seen.add(k); out.append(r)
     return out[:limit]
 
-async def _dapi_fallback(query: str, limit: int) -> List[Dict]:
-    """DAPI로 후보 시도(name_pattern, name 접두 등)"""
-    q = _clean_for_query(query)
+async def _dapi_tags(term: str, limit: int) -> List[Dict]:
+    """DAPI 태그 엔드포인트로 보강(name_pattern / 접두 매치)"""
+    q = _clean_for_query(term)
     if not q:
         return []
     param_sets = [
         {"page":"dapi","s":"tag","q":"index","json":1,"name_pattern":f"*{q}*","orderby":"count","order":"desc","limit":str(limit)},
         {"page":"dapi","s":"tag","q":"index","json":1,"name":f"{q}*","orderby":"count","order":"desc","limit":str(limit)},
     ]
-    timeout = aiohttp.ClientTimeout(total=6)
     headers = {"User-Agent": UA}
+    timeout = aiohttp.ClientTimeout(total=6)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
         for params in param_sets:
             try:
                 async with s.get(SAFEBOORU_API, params=params) as r:
-                    if r.status != 200: continue
+                    if r.status != 200: 
+                        continue
                     data = await r.json(content_type=None)
-                    if not isinstance(data, list) or not data: continue
-                    rows = []
+                    if not isinstance(data, list) or not data:
+                        continue
+                    rows: List[Dict] = []
                     for t in data:
                         name = (t.get("name") or "").strip()
-                        if not name: continue
-                        rows.append({
-                            "name": name,
-                            "count": int(t.get("count", 0) or 0),
-                            "type_text": "",  # DAPI는 type 텍스트가 다를 수 있음
-                        })
-                    rows.sort(key=lambda x: (-x["count"], x["name"].lower()))
+                        if not name:
+                            continue
+                        try:
+                            cnt = int(t.get("count", 0) or 0)
+                        except Exception:
+                            cnt = 0
+                        try:
+                            ttype = int(t.get("type")) if t.get("type") is not None else None
+                        except Exception:
+                            ttype = None
+                        rows.append({"name": name, "count": cnt, "type": ttype})
+                    # 중복 제거 + 정렬(카운트/이름)
                     out, seen = [], set()
-                    for r_ in rows:
+                    for r_ in sorted(rows, key=lambda x: (-x["count"], x["name"].lower())):
                         k = r_["name"].lower()
-                        if k in seen: continue
+                        if k in seen:
+                            continue
                         seen.add(k); out.append(r_)
                     return out[:limit]
             except Exception:
                 continue
     return []
 
-async def safebooru_tag_suggest(query: str, limit: int = 15) -> List[Dict]:
-    """자동완성2 → DAPI → 로컬 후보 순서로 폴백"""
+async def safebooru_tag_suggest(query: str, limit: int = 25) -> List[Dict]:
+    """autocomplete2 → DAPI(tags) → 로컬 목록 순으로 폴백해서 병합"""
     if not query or len(query.strip()) < 2:
         return []
+    results: Dict[str, Dict] = {}
+    # 1) autocomplete2
     try:
-        rows = await _autocomplete2(query, limit)
-        if rows:
-            return rows
+        a = await _autocomplete2(query, limit=100)
+        for it in a:
+            nm = it["name"]
+            results[nm] = {
+                "name": nm,
+                "score": _score_tag(nm, query, None, it.get("count", 0)),
+                "count": it.get("count", 0),
+                "type_text": it.get("type_text", ""),
+            }
     except Exception:
         pass
+    # 2) DAPI(tags)
     try:
-        rows = await _dapi_fallback(query, limit)
-        if rows:
-            return rows
+        b = await _dapi_tags(query, limit=100)
+        for it in b:
+            nm = it["name"]
+            sc = _score_tag(nm, query, it.get("type"), it.get("count"))
+            prev = results.get(nm)
+            if not prev or sc > prev["score"]:
+                results[nm] = {
+                    "name": nm, "score": sc,
+                    "count": it.get("count", 0),
+                    "type_text": TAG_TYPE_MAP.get(it.get("type", 0), ""),
+                }
     except Exception:
         pass
-    # 마지막 폴백: 로컬 후보에서 부분일치
-    q = _clean_for_query(query).lower()
-    picks = [t for t in POPULAR_TAGS if q in t.lower()]
-    return [{"name": t, "count": 0, "type_text": ""} for t in picks[:limit]]
+    if not results:
+        # 3) 로컬 후보
+        q = _clean_for_query(query).lower()
+        picks = [t for t in POPULAR_TAGS if q in t.lower()]
+        return [{"name": t, "count": 0, "type_text": ""} for t in picks[:limit]]
+
+    merged = sorted(results.values(), key=lambda x: x["score"], reverse=True)
+    return merged[:limit]
 
 # ----------------- 랜덤 포스트 -----------------
 async def safebooru_random_post(tag: Optional[str]) -> Optional[Dict]:
@@ -129,8 +188,8 @@ async def safebooru_random_post(tag: Optional[str]) -> Optional[Dict]:
     if tag_q:
         params["tags"] = tag_q
 
-    timeout = aiohttp.ClientTimeout(total=12)
     headers = {"User-Agent": UA}
+    timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
         async with s.get(SAFEBOORU_API, params=params) as r:
             if r.status != 200:
@@ -161,7 +220,7 @@ class SearchView(discord.ui.View):
         e = discord.Embed(title="랜덤 픽!", color=PASTEL_PINK, description=f"태그: `{_clean_for_display(self.tag) or '랜덤'}`")
         e.set_image(url=post["file_url"])
         e.add_field(name="원문", value=f"[Safebooru 열기]({post['view_url']})")
-        # 🔧 원본 메시지를 '편집'해서 버튼이 유지되도록
+        # 원본 메시지 편집(버튼 유지)
         await interaction.response.edit_message(embed=e, view=self)
 
 class AnimePicCog(commands.Cog):
@@ -188,13 +247,13 @@ class AnimePicCog(commands.Cog):
         e.add_field(name="원문", value=f"[Safebooru 열기]({post['view_url']})")
         await interaction.followup.send(embed=e, view=view, ephemeral=not public)
 
-    # 🔽 자동완성 핸들러
+    # 자동완성 핸들러
     @animepic.autocomplete("tag")
     async def animepic_tag_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
         cur = current or ""
         if len(cur.strip()) < 2:
             return []
-        rows = await safebooru_tag_suggest(cur, limit=15)
+        rows = await safebooru_tag_suggest(cur, limit=25)
         out: List[app_commands.Choice[str]] = []
         for t in rows[:25]:
             dtype = t.get("type_text", "")
@@ -202,7 +261,28 @@ class AnimePicCog(commands.Cog):
             out.append(app_commands.Choice(name=disp, value=t["name"]))
         return out
 
-    # 뷰 타임아웃 뒤 참조 정리(메모리 관리, 선택사항)
+    @app_commands.command(name="tag-suggest", description="Safebooru에서 태그 후보를 찾아줘요 (자동완성 참고용)")
+    @app_commands.describe(query="예: gawr, gura, koharu, yoimiya 등", public="채널에 공개로 보내기 (기본 비공개)")
+    async def tag_suggest(self, interaction: discord.Interaction, query: str, public: bool = False):
+        await interaction.response.defer(ephemeral=not public, thinking=True)
+        rows = await safebooru_tag_suggest(query, limit=20)
+        if not rows:
+            return await interaction.followup.send("해당 검색어로 태그를 찾지 못했어요. 철자를 바꾸거나 더 일반적인 단어로 시도해 볼까요? ꒰◍•ᴗ•◍꒱", ephemeral=not public)
+
+        e = discord.Embed(
+            title=f"태그 후보 · '{_clean_for_display(query)}'",
+            color=PASTEL_PINK,
+            description="`/animepic` 입력 칸에서도 자동완성이 떠요!",
+        )
+        for t in rows[:10]:
+            e.add_field(
+                name=t["name"],
+                value=f"유형: **{t.get('type_text','?')}** · 사용 수: **{t.get('count',0):,}**\n"
+                      f"예: `/animepic tag:{t['name']}`",
+                inline=False
+            )
+        await interaction.followup.send(embed=e, ephemeral=not public)
+
     async def cog_unload(self):
         self._live_views.clear()
 
