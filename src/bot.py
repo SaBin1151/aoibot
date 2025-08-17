@@ -36,6 +36,7 @@ async def load_extensions():
     await bot.load_extension("src.commands.animepic")
     await bot.load_extension("src.commands.poll")
     await bot.load_extension("src.commands.aoi")
+    await bot.load_extension("src.commands.help")
 
 async def main():
     async with bot:
